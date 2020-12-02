@@ -3,6 +3,8 @@
 
 
 
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core/cvdef.h>
 #include <opencv2/core/mat.hpp>
@@ -40,6 +42,7 @@
 #include <boost/thread/thread.hpp>
 
 #include <Eigen/Dense>
+
 
 #include "localization_with_artrack_cv/markerpose.hpp"
 #include "localization_with_artrack_cv/utils.h"
@@ -160,7 +163,11 @@ public:
 	void imageCb(const sensor_msgs::ImageConstPtr& msg);
 
 	// void imageCbthread(const sensor_msgs::ImageConstPtr& msg);
-    void mysolvepnp(const cv::Mat &objPoints, const cv::Mat &imgPoints, const cv::Mat &cameraMatrix, double &theta, double &t1, double &t2);
+    void mysolvepnp(const cv::Mat &objPoints, const cv::Mat &imgPoints, const cv::Mat &cameraMatrix, Eigen::AngleAxisd &rvec, Eigen::Vector3d &tvec);
+
+
+    Eigen::Affine3d Find3DAffineTransform(Eigen::Matrix3Xd in, Eigen::Matrix3Xd out);
+    Eigen::Affine2d Find2DAffineTransform(Eigen::Matrix2Xd in, Eigen::Matrix2Xd out);
 };
 
 
@@ -466,12 +473,139 @@ tf2::Transform LocalizationCv::worldToUTM(const tf2::Transform & tf)
 
     return Tout;
 }
-void LocalizationCv::mysolvepnp(const cv::Mat &objPoints, const cv::Mat &imgPoints, const cv::Mat &cameraMatrix, double &thetax, double &p1, double &p2)
+
+
+Eigen::Affine2d LocalizationCv::Find2DAffineTransform(Eigen::Matrix2Xd in, Eigen::Matrix2Xd out) {
+  // Default output
+  Eigen::Affine2d A;
+  A.linear() = Eigen::Matrix2d::Identity(2, 2);
+  A.translation() = Eigen::Vector2d::Zero();
+
+  if (in.cols() != out.cols())
+    throw "Find2DAffineTransform(): input data mis-match";
+
+  // First find the scale, by finding the ratio of sums of some distances,
+  // then bring the datasets to the same scale.
+  double dist_in = 0, dist_out = 0;
+  for (int col = 0; col < in.cols()-1; col++) {
+    dist_in  += (in.col(col+1) - in.col(col)).norm();
+    dist_out += (out.col(col+1) - out.col(col)).norm();
+  }
+  if (dist_in <= 0 || dist_out <= 0)
+    return A;
+  double scale = dist_out/dist_in;
+  out /= scale;
+
+  // Find the centroids then shift to the origin
+  Eigen::Vector2d in_ctr = Eigen::Vector2d::Zero();
+  Eigen::Vector2d out_ctr = Eigen::Vector2d::Zero();
+  for (int col = 0; col < in.cols(); col++) {
+    in_ctr  += in.col(col);
+    out_ctr += out.col(col);
+  }
+  in_ctr /= in.cols();
+  out_ctr /= out.cols();
+  for (int col = 0; col < in.cols(); col++) {
+    in.col(col)  -= in_ctr;
+    out.col(col) -= out_ctr;
+  }
+
+  // SVD
+  Eigen::MatrixXd Cov = in * out.transpose();
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(Cov, Eigen::ComputeThinU | Eigen::ComputeThinV);
+
+  // Find the rotation
+  double d = (svd.matrixV() * svd.matrixU().transpose()).determinant();
+  if (d > 0)
+    d = 1.0;
+  else
+    d = -1.0;
+  Eigen::Matrix2d I = Eigen::Matrix2d::Identity(2, 2);
+  I(1, 1) = d;
+  Eigen::Matrix2d R = svd.matrixV() * I * svd.matrixU().transpose();
+
+  // The final transform
+  A.linear() = scale * R;
+  A.translation() = scale*(out_ctr - R*in_ctr);
+
+  return A;
+}
+
+// The input 3D points are stored as columns.
+Eigen::Affine3d LocalizationCv::Find3DAffineTransform(Eigen::Matrix3Xd in, Eigen::Matrix3Xd out) {
+
+  // Default output
+  Eigen::Affine3d A;
+  A.linear() = Eigen::Matrix3d::Identity(3, 3);
+  A.translation() = Eigen::Vector3d::Zero();
+
+  if (in.cols() != out.cols())
+    throw "Find3DAffineTransform(): input data mis-match";
+
+  // First find the scale, by finding the ratio of sums of some distances,
+  // then bring the datasets to the same scale.
+  double dist_in = 0, dist_out = 0;
+  for (int col = 0; col < in.cols()-1; col++) {
+    dist_in  += (in.col(col+1) - in.col(col)).norm();
+    dist_out += (out.col(col+1) - out.col(col)).norm();
+  }
+  if (dist_in <= 0 || dist_out <= 0)
+    return A;
+  double scale = dist_out/dist_in;
+  out /= scale;
+
+  // Find the centroids then shift to the origin
+  Eigen::Vector3d in_ctr = Eigen::Vector3d::Zero();
+  Eigen::Vector3d out_ctr = Eigen::Vector3d::Zero();
+  for (int col = 0; col < in.cols(); col++) {
+    in_ctr  += in.col(col);
+    out_ctr += out.col(col);
+  }
+  in_ctr /= in.cols();
+  out_ctr /= out.cols();
+  for (int col = 0; col < in.cols(); col++) {
+    in.col(col)  -= in_ctr;
+    out.col(col) -= out_ctr;
+  }
+
+  // SVD
+  Eigen::MatrixXd Cov = in * out.transpose();
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(Cov, Eigen::ComputeThinU | Eigen::ComputeThinV);
+
+  // Find the rotation
+  double d = (svd.matrixV() * svd.matrixU().transpose()).determinant();
+  if (d > 0)
+    d = 1.0;
+  else
+    d = -1.0;
+  Eigen::Matrix3d I = Eigen::Matrix3d::Identity(3, 3);
+  I(2, 2) = d;
+  Eigen::Matrix3d R = svd.matrixV() * I * svd.matrixU().transpose();
+
+  // The final transform
+  A.linear() = scale * R;
+  A.translation() = scale*(out_ctr - R*in_ctr);
+
+  return A;
+}
+
+void LocalizationCv::mysolvepnp(const cv::Mat &objPoints, const cv::Mat &imgPoints, const cv::Mat &cameraMatrix, Eigen::AngleAxisd &rvec, Eigen::Vector3d &tvec)
 {
     std::vector< Point3f > obj;
     std::vector< Point2f > img;
     Mat(objPoints).copyTo(obj);
     Mat(imgPoints).copyTo(img);
+    Eigen::Matrix3Xd input_mat_obj=Eigen::Matrix3Xd::Zero(3,obj.size());
+    Eigen::Matrix3Xd input_mat_img=Eigen::Matrix3Xd::Zero(3,img.size());
+    Eigen::Matrix2Xd input_mat_obj_2d = Eigen::Matrix2Xd::Zero(2,obj.size());
+    Eigen::Matrix2Xd input_mat_img_2d = Eigen::Matrix2Xd::Zero(2,img.size());
+    for (int i=0; i<obj.size();i++)
+    {
+        input_mat_obj(0,i) = obj[i].x;
+        input_mat_obj(1,i) = obj[i].y;
+        input_mat_obj(2,i) = obj[i].z;
+    }
+    std::cout<<"eigen矩阵是："<<input_mat_obj<<std::endl;
     double x1,y1,z1,u1,v1,x2,y2,z2,u2,v2;
     double k1,k2;
     double g1,g2;
@@ -482,6 +616,42 @@ void LocalizationCv::mysolvepnp(const cv::Mat &objPoints, const cv::Mat &imgPoin
     cx = cameraMatrix.at<double>(0,2);
     fy = cameraMatrix.at<double>(1,1);
     cy = cameraMatrix.at<double>(1,2);
+
+       for (int i=0; i<img.size();i++)
+    {
+        input_mat_img(2,i) = (1.3114-obj[i].z)*fy/(img[i].y-cy);
+        input_mat_img(1,i) = 1.3114-obj[i].z;
+        input_mat_img(0,i) = (img[i].x-cx)*input_mat_img(2,i)/fx;
+    }
+    //std::cout<<"eigen图像矩阵是："<<input_mat_img<<std::endl;
+
+    //给2d的输入输出赋值
+    input_mat_obj_2d.row(0)=input_mat_obj.row(0);
+    input_mat_obj_2d.row(1)=input_mat_obj.row(1);
+    input_mat_img_2d.row(0)=input_mat_img.row(0);
+    input_mat_img_2d.row(1)=input_mat_img.row(2);
+
+    //Eigen::Affine3d A=Find3DAffineTransform(input_mat_obj,input_mat_img);
+    Eigen::Affine2d B=Find2DAffineTransform(input_mat_obj_2d,input_mat_img_2d);
+    Eigen::Matrix3d R=Eigen::Matrix3d::Zero(3,3);
+    R(0,0)=B.linear()(0,0);
+    R(0,1)=B.linear()(0,1);
+    R(1,2)=-1;
+    R(2,0)=B.linear()(1,0);
+    R(2,1)=B.linear()(1,1);
+    Eigen::Vector3d t;
+    t(0)=B.translation()(0);
+    t(1)=1.3114;
+    t(2)=B.translation()(1);
+    std::cout<<"R: "<<R<<std::endl;
+    std::cout<<"t: "<<t<<std::endl;
+    
+    Eigen::AngleAxisd rotation_vector;
+    rotation_vector.fromRotationMatrix(R);
+    //std::cout<<"rvec: "<<rotation_vector.axis()<<std::endl;
+    //std::cout<<"theta: "<<rotation_vector.angle()<<std::endl;
+    rvec = rotation_vector;
+    tvec = t;
 
     x1 = objPoints.at<float>(0,0);
     y1 = objPoints.at<float>(0,1);
@@ -494,35 +664,6 @@ void LocalizationCv::mysolvepnp(const cv::Mat &objPoints, const cv::Mat &imgPoin
     z2 = objPoints.at<float>(5,2);
     u2 = imgPoints.at<float>(5,0);
     v2 = imgPoints.at<float>(5,1);
-
-    H1 = 1.3114-z1;
-    H2 = 1.3114-z2;
-    g1 = H1*fy/(v1-cy);
-    k1 = g1*(u1-cx)/fx;
-    g2 = H2*fy/(v2-cy);
-    k2 = g2*(u2-cx)/fx;
-    if (std::abs(x1-x2)<0.05)
-    {
-        //x相同，则为计算cos—theta
-        double theta,t1,t2;
-        theta = std::acos((g1-g2)/(y1-y2));
-        //theta = 1.507;
-        t1 = k1-std::sin(theta)*y1-std::cos(theta)*x1;
-        t2 = g1-std::cos(theta)*y1+std::sin(theta)*x1;
-        //std::cout<<theta/M_PI*180<<" "<<t1<<" "<<t2<<std::endl;
-        double pos1,pos2;
-        pos1 = -std::cos(theta)*t1+std::sin(theta)*t2;
-        pos2 = -std::sin(theta)*t1-std::cos(theta)*t2;
-        if (std::sqrt(k1*k1+g1*g1)<15)
-        {
-           thetax=theta; 
-            p1 = pos1;
-            p2 = pos2;
-        }
-        std::cout<<"k1:"<<k1<<"g1:"<<g1<<std::endl;
-        std::cout<<"距离是: "<<std::sqrt((k1-k2)*(k1-k2)+(g1-g2)*(g1-g2))<<std::endl;
-        std::cout<<"重投影x2: "<<std::cos(theta)*k2-std::sin(theta)*g2+pos1<<"重投影y2: "<<std::sin(theta)*k2+std::cos(theta)*g2+pos2<<std::endl;
-    }
     //std::cout<<imgPoints.ptr< float >(0)[1]<<std::endl;
     //t1 = obj[0].x;
     //t2 = img[0].y;
@@ -747,7 +888,9 @@ void LocalizationCv::imageCb(const sensor_msgs::ImageConstPtr& msg)
     image_pub_.publish(cv_ptr->toImageMsg());
 
     //@ *************sovle PnP_Problem: calculate Tcw*************
-    cv::Vec3d rvec, tvec;
+    //cv::Vec3d rvec, tvec;
+    Eigen::AngleAxisd rvec;
+    Eigen::Vector3d tvec;
     //cv::OutputArray inarr;
     Mat objPoints, imgPoints;
     double theta,t1,t2;
@@ -763,7 +906,7 @@ void LocalizationCv::imageCb(const sensor_msgs::ImageConstPtr& msg)
             //solvePnP(objPoints, imgPoints, cameraMatrix, distCoeffs,rvec, tvec,false,6);
             //solvePnP(objPoints, imgPoints, cameraMatrix, distCoeffs,rvec, tvec,false,flag);
             //solvePnPRansac(objPoints, imgPoints, cameraMatrix, distCoeffs,rvec, tvec,false,100,8.0,0.99,noArray(),6);
-            mysolvepnp(objPoints,imgPoints,cameraMatrix,theta,t1,t2);
+            mysolvepnp(objPoints,imgPoints,cameraMatrix,rvec, tvec);
             //std::cout<<t1<<" "<<t2<<std::endl;
         }
             //sol
@@ -772,8 +915,8 @@ void LocalizationCv::imageCb(const sensor_msgs::ImageConstPtr& msg)
     //@ ***********remove outliers of pose *************
     PosePnPResult currpositon;
     currpositon.time = ros::Time::now();
-    currpositon.vt = tvec;
-    currpositon.rt = rvec;
+    //currpositon.vt = tvec;
+    //currpositon.rt = rvec;
     bool isnotoutliers = true;
 
     if(ids.size()>0)
@@ -798,49 +941,48 @@ void LocalizationCv::imageCb(const sensor_msgs::ImageConstPtr& msg)
     geometry_msgs::PoseWithCovarianceStamped VehiclePoseStCov;
     geometry_msgs::PoseWithCovarianceStamped VehiclePoseStCov_UTM;
 
-    VehiclePoseSt.header.seq = msg->header.seq;
-    VehiclePoseSt.header.stamp = msg->header.stamp;
-    VehiclePoseSt.header.frame_id = "world";
-    VehiclePoseSt.pose.position.x = t1;
-    VehiclePoseSt.pose.position.y = t2;
-    VehiclePoseSt.pose.position.z = 1.3114;
+ //   VehiclePoseSt.header.seq = msg->header.seq;
+ //   VehiclePoseSt.header.stamp = msg->header.stamp;
+ //   VehiclePoseSt.header.frame_id = "world";
+ //   VehiclePoseSt.pose.position.x = t1;
+ //   VehiclePoseSt.pose.position.y = t2;
+ //   VehiclePoseSt.pose.position.z = 1.3114;
     //tf::Quaternion q;
     //q=tf::createQuaternionMsgFromYaw(theta+M_PI/2);
   //  VehiclePoseSt.pose.orientation.x = q_vehicle_pose_in_world.x();
   //  VehiclePoseSt.pose.orientation.y = q_vehicle_pose_in_world.y();
   //  VehiclePoseSt.pose.orientation.z = q_vehicle_pose_in_world.z();
   //  VehiclePoseSt.pose.orientation.w = q_vehicle_pose_in_world.w();
-    VehiclePoseSt.pose.orientation = tf::createQuaternionMsgFromYaw(theta+M_PI/2);
-    pose_pub_.publish(VehiclePoseSt);
-
+  //  VehiclePoseSt.pose.orientation = tf::createQuaternionMsgFromYaw(theta+M_PI/2);
+   // pose_pub_.publish(VehiclePoseSt);
+    isnotoutliers = 1;
     static tf2_ros::TransformBroadcaster br; //? static
     //@ if at least one marker detected and the pose is not an outliers
     if (ids.size() > 0 && !objPoints.empty() && isnotoutliers)
     {   
         //@ normalazition of rotation vector
-        std::vector<double> rv = {rvec(0),rvec(1),rvec(2)};
-        double norm = sqrt(pow(rv[0],2)+pow(rv[1],2)+pow(rv[2],2));
-        for (int i = 0; i < rv.size(); ++i)
-        {
-            rv[i] = rv[i]/norm;
-        }
+       // std::vector<double> rv = {rvec(0),rvec(1),rvec(2)};
+        //double norm = sqrt(pow(rv[0],2)+pow(rv[1],2)+pow(rv[2],2));
+       // for (int i = 0; i < rv.size(); ++i)
+       // {
+       //     rv[i] = rv[i]/norm;
+       // }
 
-        tf2::Vector3 tf2rv =tf2::Vector3(rv[0], rv[1], rv[2]);
+        tf2::Vector3 tf2rv =tf2::Vector3(rvec.axis()(0),rvec.axis()(1),rvec.axis()(2));
 
         //@ construct quaternion with rotation vector
-        tf2::Quaternion Q(tf2rv, norm);
-
+        tf2::Quaternion Q(tf2rv, rvec.angle());
+    
         tf2::Vector3 v_marker_pose_in_cam = { tvec(0), tvec(1), tvec(2)};
         tf2::Quaternion q_marker_pose_in_cam = Q;
 
         //@ Tcw(world coordinate pose in camera coordinate system)
         tf2::Transform trans_cam_world(q_marker_pose_in_cam, v_marker_pose_in_cam);
-
         //@ Twc(camera pose in world coordinate system)
         tf2::Transform trans_world_cam = trans_cam_world.inverse();
         //@ convert tf2 data to geometry_msgs data
         geometry_msgs::Transform msgs_trans_world_cam = tf2::toMsg(trans_world_cam);
-
+        std::cout<<msgs_trans_world_cam<<std::endl; 
         //@ send transformation of camera to tf2 (for visualization)
         geometry_msgs::TransformStamped transformStampedCam;
         transformStampedCam.header.stamp = ros::Time::now();
@@ -877,12 +1019,12 @@ void LocalizationCv::imageCb(const sensor_msgs::ImageConstPtr& msg)
         VehiclePoseSt.header.seq = msg->header.seq;
         VehiclePoseSt.header.stamp = msg->header.stamp;
         VehiclePoseSt.header.frame_id = "world";
-        //VehiclePoseSt.pose.position.x = v_vehicle_pose_in_world.getX();
-        //VehiclePoseSt.pose.position.y = v_vehicle_pose_in_world.getY();
-        //VehiclePoseSt.pose.position.z = v_vehicle_pose_in_world.getZ();
-        VehiclePoseSt.pose.position.x = t1;
-        VehiclePoseSt.pose.position.y = t2;
-        VehiclePoseSt.pose.position.z = 1.3114;
+        VehiclePoseSt.pose.position.x = v_vehicle_pose_in_world.getX();
+        VehiclePoseSt.pose.position.y = v_vehicle_pose_in_world.getY();
+        VehiclePoseSt.pose.position.z = v_vehicle_pose_in_world.getZ();
+       // VehiclePoseSt.pose.position.x = t1;
+        //VehiclePoseSt.pose.position.y = t2;
+        //VehiclePoseSt.pose.position.z = 1.3114;
         VehiclePoseSt.pose.orientation.x = q_vehicle_pose_in_world.x();
         VehiclePoseSt.pose.orientation.y = q_vehicle_pose_in_world.y();
         VehiclePoseSt.pose.orientation.z = q_vehicle_pose_in_world.z();
